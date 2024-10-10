@@ -1,0 +1,422 @@
+#!/usr/bin/perl -w
+
+# OUTSTANDING TASKS
+# -----------------
+# Add the EOL date to the output even while still supported, so we can proactively tell at a glance when an updat3e will be needed
+
+
+
+# CHANGE LOG
+# ----------
+#  2024/10/10 	njeffrey 	Script created
+
+
+# DESCRIPTION
+# -----------
+#  This script is a nagios check that returns the Fortinet hardware model and FortiOS version
+#
+
+
+# IMPORTANT OID values:
+# 
+# 1.3.6.1.2.1.47.1.1.1.1.10.1
+# iso.org.dod.internet.mib.entityMIB.entityMIBObjects.entityPhysical.entPhysicalTable.entPhysicalEntry.entPhysicalSoftwareRev
+# 
+# The vendor-specific software revision string for the physical entity.
+# Note that if revision information is stored internally in a non-printable (e.g., binary) format, 
+# then the agent must convert such information to a printable format in an implementation-specific manner.
+# If no specific software programs are associated with the physical component, or if this information 
+# is unknown to the agent, then this object will contain a zero-length string.
+#
+# For example:
+# snmpget -Onq -v 1 -c public myrouter.example.com 1.3.6.1.2.1.47.1.1.1.1.10.1
+# .1.3.6.1.2.1.47.1.1.1.1.10.1 "FortiGate-100F v6.4.15,build2095,240129 (GA.M)"
+
+# NOTES
+# -----
+#
+#  Tested on FortiOS 6.4, 7.0, 7.2, 7.4, 7.6
+#
+#  This script should return one (and only one) line of ouput.  Multiple lines of output are silently ignored by nagios.
+#  The line of output will become the body of the alert message sent by nagios
+#
+# Sample output:
+#   FortiOS WARN FortiOS 6.4 reached EOL 2024-09-30, please upgrade to a supported version.  FortiGate-100F v6.4.15,build2095,240129 (GA.M) |
+#   FortiOS WARN FortiOS 7.2.6 is vulnerable to CVE-2024-23113, please update.  https://www.fortiguard.com/psirt/FG-IR-24-029  FortiWiFi-40F v7.2.6,build1639,240313 (GA.M) |
+#   FortiOS OK FortiWiFi-40F v7.2.8,build1639,240313 (GA.M) |
+#
+#
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#   # Parameters are SNMP community name
+#   define service{
+#           use                             generic-service
+#           host_name                       forti1,forti2,forti3
+#           service_description             FortiOS
+#           check_command                   check_fortios!public
+#           }
+#
+#  You will need a section in the commands.cfg
+#  file on the nagios server that looks similar to the following.
+#     # ---------------------------------------------------------------------------
+#     # 'check_fortios' command definition for monitoring FortiOS version on a FortiNet device
+#     # parameters are -H hostname -C snmp_community
+#     define command{
+#             command_name    check_fortios
+#             command_line    $USER1$/check_fortios -H $HOSTADDRESS$ -c $ARG1$
+#             }
+#
+#
+#
+
+
+use strict;					#enforce good coding practices
+use Getopt::Long;                       	#allow --long-switches to be used as parameters
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$host,$community,$community_default);
+my ($key,$output_message,$perf_data,$fortios_version);
+my ($opt_c,$opt_h,$opt_v,$opt_H);
+my ($verbose,$oid,$session,$error,$result);
+my ($pingstatus,$error_count);
+my ($major,$minor,$patch);
+my ($cmd,$snmpget,$snmpwalk);
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+$community_default  = "public";			#use this value if user does not specify SNMP community string
+$CHECK_NAME         = "FortiOS";
+$verbose            = "no";			#yes/no flag for debugging
+$snmpget            = "/usr/bin/snmpget";	#location of binary
+$snmpwalk           = "/usr/bin/snmpwalk";	#location of binary
+$perf_data          = "";			#initialize variable
+$output_message     = "";			#initialize variable
+
+#
+# Nagios return codes
+#
+$OK       = 0;
+$WARN     = 1;
+$CRITICAL = 2;
+$UNKNOWN  = 3;
+
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"          => \$opt_h,
+      "v"   => \$opt_v, "verbose"       => \$opt_v,
+      "c=s" => \$opt_c, "community=s"   => \$opt_c, 
+      "H=s" => \$opt_H, "host=s"        => \$opt_H, 
+   );
+   #
+   # If the user did not supply a --community= value, use the default.
+   #
+   if( defined( $opt_c ) ) {
+      $community = $opt_c;
+   } else {
+      $community = $community_default;
+   }
+   #
+   # If the user did not supply a -H or --host== value, generate a warning.
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME Unknown - cannot determine remote host.  Usage: $0 -H host -c community \n";
+      exit $UNKNOWN;					#exit script
+   }
+   #
+   # If the user supplied -v or --verbose switch, increase script output verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   }
+   print "   host=$host community=$community  \n" if ($verbose eq "yes");
+}                       				#end of subroutine
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # Confirm required files exist 
+   # 
+   $snmpget = "/usr/local/bin/snmpget"   if ( -e "/usr/local/bin/snmpget" );
+   $snmpget = "/usr/bin/snmpget"          if ( -e "/usr/bin/snmpget" );
+   if ( ! -f "$snmpget" ) {
+      print "ERROR: Cannot find $snmpget \n";
+      exit;
+   }
+   if ( ! -x "$snmpget" ) {
+      print "ERROR: $snmpget is not executable by the current user\n";
+      exit;
+   }
+   $snmpwalk = "/usr/local/bin/snmpwalk"   if ( -e "/usr/local/bin/snmpget" );
+   $snmpwalk = "/usr/bin/snmpwalk"         if ( -e "/usr/bin/snmpget" );
+   if ( ! -f "$snmpwalk" ) {
+      print "ERROR: Cannot find $snmpwalk \n";
+      exit;
+   }
+   if ( ! -x "$snmpwalk" ) {
+      print "ERROR: $snmpwalk is not executable by the current user\n";
+      exit;
+   }
+   #
+   # confirm a remote host is defined
+   if( ! defined( $host ) ) {
+      print "$CHECK_NAME Unknown - missing name of remote host to check.  Use $0 -h for help\n";
+      exit $UNKNOWN;                                    #exit script
+   }
+}							#end of subroutine
+
+
+
+
+sub get_usage {
+   #
+   # this subroutine gets called if user enters -h or --help parameters
+   print "running get_usage subroutine \n" if ($verbose eq "yes");
+   #
+   if( $opt_h ) {
+      print "Nagios plugin for determining health of Brocade fibre switch \n";
+      print "$0 [options]  \n";
+      print "    where options are: \n";
+      print "    -c --community=SNMP_community_string     (default=public)\n";
+      print "    -h --help \n";
+      print "    -H --host=IP|hostname \n";
+      print "\n\n";
+      exit;
+   }                                            	#end of if block
+}							#end of subroutine
+
+
+
+
+sub ping_remote_host {
+   #
+   print "running ping_remote_host subroutine \n" if ($verbose eq "yes");
+   #
+   # Confirm the remote host is up
+   #
+   print "trying to ping $host \n" if ($verbose eq "yes");
+   open(IN,"ping -c 4 -w 4 $host 2>&1 |");         	#send up to 4 pings and wait up to 4 seconds for reply
+   while (<IN>) {                                  	#read a line from STDIN
+      if ( /100% packet loss/ ) {                  	#check for ping timeouts (indicates host may be down)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- no ping reply from $host \n";
+         print $pingstatus;                            	#print error message
+         exit $UNKNOWN;                            	#exit script
+      }                                            	#end of if block
+      if ( /NOT FOUND/ ) {                         	#check for invalid hostname (using AIX ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host \n";
+         print $pingstatus;                            	#print error message
+         exit $UNKNOWN;                            	#exit script
+      }                                            	#end of if block
+      if ( /unknown host/ ) {                      	#check for invalid hostname (using Linux ping)
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not resolve hostname $host \n";
+         print $pingstatus;                            	#print error message
+         exit $UNKNOWN;                            	#exit script
+      }                                            	#end of if block
+      if ( /no route to host/ ) {                  	#check for routing problems
+         $pingstatus = "$CHECK_NAME UNKNOWN -- could not find a route to $host - check routing tables \n";
+         print $pingstatus;                            	#print error message
+         exit $UNKNOWN;                            	#exit script
+      }                                            	#end of if block
+   }                                               	#end of while loop
+   close IN;                                       	#close filehandle
+}							#end of subroutine
+
+
+
+
+
+
+
+
+
+
+sub get_fortios_version {
+   #
+   print "running get_fortios_version subroutine \n" if ($verbose eq "yes");
+   #
+   # This is also a sanity check that cnrims the remote host has a listening SNMP daemon
+   #
+   # Sample output showing system description for various devices.
+   #    snmpget -Onq -v 1 -c public myrouter.example.com 1.3.6.1.2.1.47.1.1.1.1.10.1
+   #    .1.3.6.1.2.1.47.1.1.1.1.10.1 "FortiGate-100F v6.4.15,build2095,240129 (GA.M)"
+   #
+   #
+   #
+   #
+   $fortios_version = "";                                                #initialize variable to avoid undef errors
+   $oid = ".1.3.6.1.2.1.47.1.1.1.1.10.1"; 				#SNMP OID that shows FortiOS version
+   $cmd = "$snmpget -Onq -v 1 -c $community $host $oid 2>&1"; 		#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |"); 							#open a filehandle for reading 
+   while (<IN>) {                          				#read a line from STDIN
+      s/\"//g;                                                          #get rid of quotation marks
+      if ( /$oid (.*)/ ) { 						#confirm the OID is returned,
+         $fortios_version = $1;						#assign more mnemonic variable name
+         if ($fortios_version =~ /Forti/) {					#
+            print "   Found Fortinet device: $fortios_version \n" if ($verbose eq "yes");
+         } else {
+            print "   Found non-Fortinet device: $fortios_version \n" if ($verbose eq "yes");
+            print "$CHECK_NAME WARN - this is not a Fortinet device, so cannot be checked for FortiOS version: $fortios_version \n";
+            exit $WARN;							#exit script 
+         } 								#end of unless block
+      } 								#end of if block
+    
+   }									#end of while loop
+   close IN;								#close filehandle
+   #
+   # parse out the major.minor.patch level of FortiOS
+   if ($fortios_version =~ / v([0-9]+)\.([0-9]+)\.([0-9]+),build/ ) {
+      $major = $1;
+      $minor = $2;
+      $patch = $3;
+      print "   FortiOS version is $major.$minor.$patch \n" if ($verbose eq "yes");
+     
+   }
+   #
+   # We should only get this far if there was no SNMP response at all
+   unless ( $fortios_version =~ /Forti/ ) {
+      print "$CHECK_NAME WARN - could not query $host via SNMP.  Confirm you have the correct SNMP community string and the remote host $host has a working SNMP daemon.\n";
+      exit $WARN;							#exit script 
+   }									#end of unless block
+}									#end of subroutine
+
+
+
+sub check_for_eol_version {
+   #
+   print "running check_for_eol_version subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine looks for firmware versions that are known to be obsolete.
+   # It is expected that this section will need to be updated every year or so when new EOL dates are announced.
+   #
+   #
+   # Only check for buggy or obsolete firmware levels on Tuesday
+   # This gives the sysadmin a reminder once a week, but still lets regular alerts happen if it takes weeks or months to update the firmware.
+   # $wday is day of week with 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
+   my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+   $year = $year + 1900;									#returned value is years since 1900
+   $mon = $mon + 1;										#returned value is zero-indexed, so Jan=0 Feb=1 Mar=2.  Add 1 to fix up.
+   unless ( $wday == 2 ) {
+      print "   firmware is only checked on Tuesdays - skipping subroutine \n" if ($verbose eq "yes");
+      return;                                                                                   #break out of subroutine
+   }                                                                                            #end of unless block
+   $output_message = $fortios_version;								#initialize variable
+   #
+   #
+   # Alert on end-of-life versions of FortiOS
+   #
+   if ( ($year >= 2022) && ($mon >= 10) && ($major == 6) && ($minor == 0) ) {
+      print "$CHECK_NAME WARN FortiOS 6.0 reached EOL 2022-09-22, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2023) && ($mon >= 10) && ($major == 6) && ($minor == 2) ) {
+      print "$CHECK_NAME WARN FortiOS 6.2 reached EOL 2023-09-28, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2024) && ($mon >= 10) && ($major == 6) && ($minor == 4) ) {
+      print "$CHECK_NAME WARN FortiOS 6.4 reached EOL 2024-09-30, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2025) && ($mon >= 10) && ($major == 7) && ($minor == 0) ) {
+      print "$CHECK_NAME WARN FortiOS 7.0 reached EOL 2025-09-30, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2026) && ($mon >= 10) && ($major == 7) && ($minor == 2) ) {
+      print "$CHECK_NAME WARN FortiOS 7.2 reached EOL 2026-09-30, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2027) && ($mon >= 11) && ($major == 7) && ($minor == 4) ) {
+      print "$CHECK_NAME WARN FortiOS 7.4 reached EOL 2027-11-07, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+   if ( ($year >= 2029) && ($mon >= 1) && ($major == 7) && ($minor == 6) ) {
+      print "$CHECK_NAME WARN FortiOS 7.6 reached EOL 2029-01-25, please upgrade to a supported version.  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+}									#end of subroutine
+
+
+
+
+sub check_for_known_vulnerabilities {
+   #
+   print "running check_for_known_vulnerabilities subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine looks for firmware versions that are known to have vulnerabilities
+   # It is expected that this section will need to be updated regularly as new vulnerabilities are announced.
+   #
+   #
+   # Only check for buggy or obsolete firmware levels on Tuesday
+   # This gives the sysadmin a reminder once a week, but still lets regular alerts happen if it takes weeks or months to update the firmware.
+   # $wday is day of week with 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday
+   my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+   $year = $year + 1900;									#returned value is years since 1900
+   $mon = $mon + 1;										#returned value is zero-indexed, so Jan=0 Feb=1 Mar=2.  Add 1 to fix up.
+   unless ( $wday == 2 ) {
+      print "   firmware is only checked on Tuesdays - skipping subroutine \n" if ($verbose eq "yes");
+      return;                                                                                   #break out of subroutine
+   }                                                                                            #end of unless block
+   $output_message = $fortios_version;								#initialize variable
+   #
+   #
+   # Alert on known vulnerabilities in FortiOS
+   #
+   # CVE-2024-23113 https://www.fortiguard.com/psirt/FG-IR-24-029
+   if ( (($major == 7) && ($minor == 0) && ($patch < 14)) || (($major == 7) && ($minor == 2) && ($patch < 7)) ||  (($major == 7) && ($minor == 4) && ($patch < 3)) ) {
+      print "$CHECK_NAME WARN FortiOS $major.$minor.$patch is vulnerable to CVE-2024-23113, please update.  https://www.fortiguard.com/psirt/FG-IR-24-029  $output_message | $perf_data \n";
+      exit $WARN;
+   }
+}									#end of subroutine
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # build an output message that contains all the information
+   #
+   $error_count = 0;										#initialize variable
+   $output_message = $fortios_version;								#initialize variable
+   $perf_data = "";										#initialize variable, this check does not have any performance data
+   #
+   # If we get this far, all ports are fine
+   if ($error_count == 0) {
+      print "$CHECK_NAME OK $output_message | $perf_data \n";
+      exit $OK;
+   } 
+}						#end of subroutine
+
+
+
+
+
+
+# ----------------------- main body of program -------------------------------
+get_options;
+sanity_checks;
+get_usage;
+ping_remote_host;
+get_fortios_version;
+check_for_eol_version;
+check_for_known_vulnerabilities;
+print_output;
+
